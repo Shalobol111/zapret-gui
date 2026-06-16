@@ -348,6 +348,120 @@ class StrategyDetector:
 
 
 # ════════════════════════════════════════════════════════════════
+# FilterManager — управление IPSet / Game фильтрами через файлы zapret
+# ════════════════════════════════════════════════════════════════
+
+class FilterManager:
+    """Меняет фильтры zapret напрямую через файлы — ровно так же, как это
+    делает service.bat, но без запуска .bat (это простые файловые операции).
+
+    Game filter — управляется файлом utils/game_filter.enabled:
+        отсутствует → off | 'all' → tcp-udp | 'tcp' → tcp | 'udp' → udp
+    IPSet filter — управляется содержимым lists/ipset-all.txt:
+        пусто → any | плейсхолдер 203.0.113.113/32 → off | иначе → loaded
+    """
+
+    IPSET_PLACEHOLDER = "203.0.113.113/32"
+    GAME_MODES  = ("off", "tcp", "udp", "tcp-udp")
+    IPSET_MODES = ("off", "any", "loaded")
+    # Соответствие режима GUI ↔ содержимого game_filter.enabled
+    _GAME_TO_FILE = {"tcp": "tcp", "udp": "udp", "tcp-udp": "all"}
+    _FILE_TO_GAME = {"all": "tcp-udp", "tcp": "tcp", "udp": "udp"}
+
+    def __init__(self, program_path: str):
+        self.program_path = program_path
+
+    # ── Пути к управляющим файлам ──
+    def _game_flag(self) -> str:
+        return os.path.join(self.program_path, "utils", "game_filter.enabled")
+
+    def _ipset_list(self) -> str:
+        return os.path.join(self.program_path, "lists", "ipset-all.txt")
+
+    def _ipset_backup(self) -> str:
+        return self._ipset_list() + ".backup"
+
+    def available(self) -> bool:
+        return bool(self.program_path) and os.path.isdir(self.program_path)
+
+    # ── Game filter ──
+    def get_game_mode(self) -> str:
+        f = self._game_flag()
+        if not os.path.isfile(f):
+            return "off"
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                val = fh.readline().strip().lower()
+        except OSError:
+            return "off"
+        return self._FILE_TO_GAME.get(val, "off")
+
+    def set_game_mode(self, mode: str) -> Tuple[bool, str]:
+        if mode not in self.GAME_MODES:
+            return False, f"Неизвестный режим game filter: {mode}"
+        f = self._game_flag()
+        try:
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            if mode == "off":
+                if os.path.isfile(f):
+                    os.remove(f)
+            else:
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write(self._GAME_TO_FILE[mode] + "\n")
+            log.info(f"Game filter → {mode}")
+            return True, "Game filter изменён. Перезапустите zapret для применения."
+        except OSError as e:
+            return False, f"Не удалось изменить game filter: {e}"
+
+    # ── IPSet filter ──
+    def get_ipset_mode(self) -> str:
+        lst = self._ipset_list()
+        if not os.path.isfile(lst):
+            return "any"
+        try:
+            with open(lst, encoding="utf-8", errors="replace") as fh:
+                nonblank = [ln for ln in fh.read().splitlines() if ln.strip()]
+        except OSError:
+            return "any"
+        if not nonblank:
+            return "any"
+        if any(self.IPSET_PLACEHOLDER in ln for ln in nonblank):
+            return "off"
+        return "loaded"
+
+    def set_ipset_mode(self, mode: str) -> Tuple[bool, str]:
+        if mode not in self.IPSET_MODES:
+            return False, f"Неизвестный режим IPSet: {mode}"
+        lst    = self._ipset_list()
+        backup = self._ipset_backup()
+        cur    = self.get_ipset_mode()
+        try:
+            os.makedirs(os.path.dirname(lst), exist_ok=True)
+            # Перед уничтожением загруженного списка всегда сохраняем его в .backup,
+            # чтобы режим «loaded» можно было восстановить и данные не потерялись.
+            if cur == "loaded" and mode != "loaded" and os.path.isfile(lst):
+                shutil.copy2(lst, backup)
+
+            if mode == "off":
+                with open(lst, "w", encoding="utf-8") as fh:
+                    fh.write(self.IPSET_PLACEHOLDER + "\n")
+            elif mode == "any":
+                open(lst, "w", encoding="utf-8").close()  # пустой файл
+            else:  # loaded
+                if cur == "loaded":
+                    pass  # уже загружен
+                elif os.path.isfile(backup) and os.path.getsize(backup) > 0:
+                    shutil.copy2(backup, lst)
+                else:
+                    return False, ("Нет сохранённого IP-списка для восстановления. "
+                                   "Сначала обновите IPSet (вкладка «Службы»).")
+            log.info(f"IPSet фильтр → {mode}")
+            return True, "IPSet фильтр изменён. Перезапустите zapret для применения."
+        except OSError as e:
+            return False, f"Не удалось изменить IPSet фильтр: {e}"
+
+
+# ════════════════════════════════════════════════════════════════
 # ProcessManager
 # ════════════════════════════════════════════════════════════════
 
@@ -762,15 +876,61 @@ class UpdateChecker:
     def check_async(self) -> None:
         threading.Thread(target=self._check, daemon=True).start()
 
-    def fetch_latest_version(self) -> Optional[str]:
-        """Скачивает строку актуальной версии из version.txt."""
+    def _fetch_version_txt(self) -> Optional[str]:
+        """Пробует получить версию из version.txt (raw.githubusercontent.com)."""
         req = urllib.request.Request(
             ZAPRET_VERSION_URL,
             headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}",
                      "Cache-Control": "no-cache"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.read().decode("utf-8", "replace").strip()
+
+    def _fetch_version_api(self) -> Optional[str]:
+        """Запасной источник версии — tag_name из GitHub API (api.github.com).
+        Полезен, когда raw.githubusercontent.com заблокирован/недоступен."""
+        req = urllib.request.Request(
+            GITHUB_API_URL,
+            headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        tag = (data.get("tag_name") or "").strip()
+        return tag or None
+
+    def fetch_latest_version(self) -> Optional[str]:
+        """Возвращает актуальную версию zapret. Сначала пробует version.txt,
+        при ошибке — GitHub API (два независимых домена повышают шанс на успех
+        при блокировках). Бросает последнее исключение, если оба недоступны."""
+        last_err: Optional[Exception] = None
+        for fetch in (self._fetch_version_txt, self._fetch_version_api):
+            try:
+                v = fetch()
+                if v:
+                    return v
+            except Exception as e:  # noqa: BLE001 — пробуем следующий источник
+                last_err = e
+                log.debug(f"Источник версии недоступен: {e}")
+        if last_err is not None:
+            raise last_err
+        return None
+
+    @staticmethod
+    def friendly_error(e: Exception) -> str:
+        """Превращает сетевую ошибку в понятное пользователю сообщение."""
+        text = str(e).lower()
+        if "timed out" in text or "timeout" in text:
+            return ("сервер обновлений не отвечает (таймаут). Возможно, домен "
+                    "заблокирован — попробуйте при работающем zapret.")
+        if "ssl" in text or "handshake" in text or "certificate" in text:
+            return ("не удалось установить защищённое соединение. Возможно, "
+                    "домен обновлений заблокирован — попробуйте позже.")
+        if any(s in text for s in ("getaddrinfo", "name or service",
+                                   "name resolution", "nodename", "11001")):
+            return "нет подключения к интернету или DNS недоступен."
+        if "refused" in text or "unreachable" in text or "urlopen" in text:
+            return "не удалось связаться с сервером обновлений."
+        return f"ошибка сети: {e}"
 
     def fetch_download_url(self) -> Optional[str]:
         """Возвращает прямую ссылку на .zip-ассет последнего релиза."""
@@ -798,7 +958,7 @@ class UpdateChecker:
         except Exception as e:
             log.warning(f"Проверка версии zapret: {e}")
             self._emit({"status": "error", "local": local,
-                        "latest": None, "error": str(e)})
+                        "latest": None, "error": self.friendly_error(e)})
             return
 
         if not latest:
@@ -835,8 +995,18 @@ class ZapretUpdater:
     """Скачивает .zip последнего релиза и аккуратно заменяет файлы
     установленной сборки zapret. Пользовательские списки не затираются."""
 
-    # Файлы, которые НЕ перезаписываем (правки пользователя)
-    KEEP_FILES = ("list-general-user.txt",)
+    # Точные имена пользовательских файлов, которые НЕ перезаписываем.
+    # Сюда входят все списки, редактируемые в GUI (вкладка «Конфигурация»),
+    # — их базовые имена берём прямо из CONFIG_FILE_PATTERNS, плюс IP-списки.
+    KEEP_FILES = tuple(sorted({
+        os.path.basename(p).lower()
+        for pats in CONFIG_FILE_PATTERNS.values()
+        for p in pats
+        if os.path.basename(p).lower() != "hosts"   # hosts — системный, не в папке zapret
+    } | {
+        "ipset-all.txt",         # загруженный IP-список (может быть 500+ КБ)
+        "ipset-all.txt.backup",  # его резервная копия
+    }))
     # Службы zapret, держащие winws.exe и драйвер WinDivert
     SERVICE_NAMES = ("zapret", "WinDivert", "WinDivert14")
 
@@ -1017,16 +1187,30 @@ class ZapretUpdater:
             self._pending_old.append(old)
             shutil.copy2(src_file, dst_file)
 
+    def _is_user_file(self, name: str) -> bool:
+        """True, если файл хранит пользовательские данные/настройки и его
+        нельзя перезаписывать содержимым из архива обновления."""
+        n = name.lower()
+        if n.endswith("-user.txt"):
+            return True          # list-general-user / list-exclude-user / ipset-exclude-user
+        if n in self.KEEP_FILES:
+            return True          # ipset-all.txt и его .backup
+        if n.endswith(".enabled"):
+            return True          # game_filter.enabled, check_updates.enabled (флаги настроек)
+        return False
+
     def _copy_tree(self, src: str, dst: str) -> None:
-        """Копирует дерево src поверх dst, сохраняя пользовательские списки."""
+        """Копирует дерево src поверх dst, сохраняя пользовательские списки
+        и настройки (см. _is_user_file)."""
         for root, _dirs, files in os.walk(src):
             rel = os.path.relpath(root, src)
             target = dst if rel == "." else os.path.join(dst, rel)
             os.makedirs(target, exist_ok=True)
             for name in files:
                 dst_file = os.path.join(target, name)
-                if name in self.KEEP_FILES and os.path.isfile(dst_file):
-                    continue  # не затираем пользовательские домены
+                # Существующие пользовательские файлы не трогаем
+                if self._is_user_file(name) and os.path.isfile(dst_file):
+                    continue
                 self._safe_copy(os.path.join(root, name), dst_file)
 
 
@@ -1108,6 +1292,7 @@ class ZapretGUI(ctk.CTk):
         prog_path = self.settings.get("program_path", "")
         self.proc_mgr = ProcessManager(prog_path)
         self.detector = StrategyDetector(prog_path)
+        self.filters  = FilterManager(prog_path)
         self.strategies: List[Dict] = []
         self._config_map: Dict[str, str] = {}
         self._poll_id: Optional[str] = None
@@ -1309,28 +1494,49 @@ class ZapretGUI(ctk.CTk):
         )
         self._info_label.pack(anchor="w", padx=16, pady=14)
 
-        # Дополнительные опции
+        # Фильтры IPSet / Game — меняют файлы zapret напрямую (как service.bat)
         of = self._card(parent)
         of.grid(row=3, column=0, sticky="ew", padx=14, pady=(8, 14))
+        of.grid_columnconfigure((0, 1), weight=1)
 
         ctk.CTkLabel(
-            of, text="Дополнительно", font=("Segoe UI Semibold", 13),
+            of, text="Фильтры", font=("Segoe UI Semibold", 13),
             text_color=TXT_NORMAL,
-        ).pack(anchor="w", padx=16, pady=(12, 4))
-        row = ctk.CTkFrame(of, fg_color="transparent")
-        row.pack(anchor="w", padx=12, pady=(0, 12))
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
 
-        self._ipset_var = tk.BooleanVar(value=self.settings.get("ipset_filter", True))
-        ctk.CTkCheckBox(
-            row, text="IPSet фильтр", variable=self._ipset_var, font=("Segoe UI", 12),
-            command=lambda: self.settings.set("ipset_filter", self._ipset_var.get()),
-        ).pack(side="left", padx=8)
+        # IPSet фильтр
+        ipc = ctk.CTkFrame(of, fg_color="transparent")
+        ipc.grid(row=1, column=0, sticky="w", padx=(12, 6), pady=(0, 14))
+        ctk.CTkLabel(
+            ipc, text="IPSet фильтр", font=("Segoe UI", 12), text_color=TXT_DIM,
+        ).pack(anchor="w", padx=6, pady=(0, 2))
+        self._ipset_var = tk.StringVar(value="any")
+        self._ipset_menu = ctk.CTkOptionMenu(
+            ipc, variable=self._ipset_var, values=list(FilterManager.IPSET_MODES),
+            width=170, height=34, font=("Segoe UI", 12),
+            fg_color=CARD2_BG, button_color=ACCENT, button_hover_color=ACCENT_HOVER,
+            text_color=TXT_NORMAL,
+            command=self._on_ipset_change,
+        )
+        self._ipset_menu.pack(anchor="w", padx=6)
 
-        self._game_var = tk.BooleanVar(value=self.settings.get("game_filter", False))
-        ctk.CTkCheckBox(
-            row, text="Game Filter", variable=self._game_var, font=("Segoe UI", 12),
-            command=lambda: self.settings.set("game_filter", self._game_var.get()),
-        ).pack(side="left", padx=8)
+        # Game filter
+        gmc = ctk.CTkFrame(of, fg_color="transparent")
+        gmc.grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(0, 14))
+        ctk.CTkLabel(
+            gmc, text="Game filter", font=("Segoe UI", 12), text_color=TXT_DIM,
+        ).pack(anchor="w", padx=6, pady=(0, 2))
+        self._game_var = tk.StringVar(value="off")
+        self._game_menu = ctk.CTkOptionMenu(
+            gmc, variable=self._game_var, values=list(FilterManager.GAME_MODES),
+            width=170, height=34, font=("Segoe UI", 12),
+            fg_color=CARD2_BG, button_color=ACCENT, button_hover_color=ACCENT_HOVER,
+            text_color=TXT_NORMAL,
+            command=self._on_game_change,
+        )
+        self._game_menu.pack(anchor="w", padx=6)
+
+        self._refresh_filter_state()
 
     # ── Вспомогательные конструкторы UI ───────────────────────────
 
@@ -1986,6 +2192,50 @@ class ZapretGUI(ctk.CTk):
         disp = self._strat_var.get()
         return next((s for s in self.strategies if s["display"] == disp), None)
 
+    # ──────────────────── Фильтры IPSet / Game ────────────────────
+
+    def _refresh_filter_state(self) -> None:
+        """Считывает текущее состояние фильтров из файлов zapret и
+        выставляет выпадающие списки. Если путь не задан — блокирует их."""
+        if not self.filters.available():
+            self._ipset_var.set("any")
+            self._game_var.set("off")
+            self._ipset_menu.configure(state="disabled")
+            self._game_menu.configure(state="disabled")
+            return
+        self._ipset_menu.configure(state="normal")
+        self._game_menu.configure(state="normal")
+        self._ipset_var.set(self.filters.get_ipset_mode())
+        self._game_var.set(self.filters.get_game_mode())
+
+    def _on_ipset_change(self, mode: str) -> None:
+        if not self.filters.available():
+            messagebox.showwarning("Путь не задан",
+                                   "Сначала укажите путь к папке zapret.")
+            self._refresh_filter_state()
+            return
+        ok, msg = self.filters.set_ipset_mode(mode)
+        if ok:
+            self._info_label.configure(
+                text=f"IPSet фильтр: {mode}. {msg}", text_color=TXT_DIM)
+        else:
+            messagebox.showerror("IPSet фильтр", msg)
+            self._refresh_filter_state()  # откатываем на реальное состояние
+
+    def _on_game_change(self, mode: str) -> None:
+        if not self.filters.available():
+            messagebox.showwarning("Путь не задан",
+                                   "Сначала укажите путь к папке zapret.")
+            self._refresh_filter_state()
+            return
+        ok, msg = self.filters.set_game_mode(mode)
+        if ok:
+            self._info_label.configure(
+                text=f"Game filter: {mode}. {msg}", text_color=TXT_DIM)
+        else:
+            messagebox.showerror("Game filter", msg)
+            self._refresh_filter_state()
+
     def _start_strategy(self) -> None:
         s = self._selected_strategy()
         if not s:
@@ -2262,8 +2512,10 @@ class ZapretGUI(ctk.CTk):
         self.settings.set("program_path", path)
         self.proc_mgr.program_path = path
         self.detector.program_path = path
+        self.filters.program_path = path
         self._refresh_strategies()
         self._refresh_config_files()
+        self._refresh_filter_state()
         log.info(f"Путь установлен: {path}")
         messagebox.showinfo("Готово", f"Путь к программе:\n{path}")
 
@@ -2476,6 +2728,7 @@ class ZapretGUI(ctk.CTk):
             messagebox.showinfo("Готово", msg)
             self._refresh_strategies()
             self._refresh_config_files()
+            self._refresh_filter_state()
         else:
             self._set_update_status("✖  " + msg, RED)
             log.error(msg)
